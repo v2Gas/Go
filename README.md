@@ -1,2 +1,1 @@
-# Go
-Go implementation of Gaseous protocol.
+# Go TLS
