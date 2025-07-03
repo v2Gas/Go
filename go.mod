@@ -4,6 +4,8 @@ go 1.18
 
 require (
 	golang.org/x/crypto v0.0.0-20211215153901-e495a2d5b3d3
+        github.com/klauspost/compress v1.17.2
+	github.com/pierrec/lz4/v4 v4.1.21
 	github.com/ulikunitz/xz v0.5.12
 )
 
