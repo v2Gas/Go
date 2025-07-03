@@ -1,4 +1,4 @@
-module github.com/nXTLS/Go
+module github.com/v2Gas/Go
 
 go 1.18
 
