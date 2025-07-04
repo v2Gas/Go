@@ -5,12 +5,37 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sort"
+
+	utls "github.com/refraction-networking/utls"
 )
+
+// ========== 指纹参数结构 ==========
+type GaseousClientHelloParams struct {
+	SpecType  string            // uTLS 指纹名
+	SNI       string
+	ALPN      []string
+	Random    []byte
+	SessionID []byte
+	Other     map[string][]byte // 扩展参数预留
+}
+
+// ========== uTLS 指纹集 ==========
+var allUTLSIDs = []utls.ClientHelloID{
+	utls.HelloChrome_58, utls.HelloChrome_62, utls.HelloChrome_70, utls.HelloChrome_72,
+	utls.HelloChrome_83, utls.HelloChrome_87, utls.HelloChrome_96, utls.HelloChrome_100,
+	utls.HelloChrome_102, utls.HelloChrome_106_Shuffle, utls.HelloChrome_115_PQ, utls.HelloChrome_120,
+	utls.HelloChrome_120_PQ, utls.HelloChrome_131, utls.HelloFirefox_55, utls.HelloFirefox_56,
+	utls.HelloFirefox_63, utls.HelloFirefox_65, utls.HelloFirefox_99, utls.HelloFirefox_102,
+	utls.HelloFirefox_105, utls.HelloFirefox_120, utls.HelloIOS_11_1, utls.HelloIOS_12_1,
+	utls.HelloIOS_13, utls.HelloIOS_14, utls.HelloAndroid_11_OkHttp, utls.HelloEdge_85,
+	utls.HelloEdge_106, utls.HelloSafari_16_0, utls.Hello360_7_5, utls.Hello360_11_0,
+	utls.HelloQQ_11_1, utls.HelloChrome_100_PSK, utls.HelloChrome_112_PSK_Shuf,
+	utls.HelloChrome_114_Padding_PSK_Shuf, utls.HelloChrome_115_PQ_PSK,
+}
 
 // ========== ClientHello 参数字段完整解析 ==========
 
-// 参考 RFC 5246/8446，完整解码 TLS ClientHello（支持TLS 1.2/1.3主流格式）
-// 返回所有常见字段：CipherSuites, CompressionMethods, SNI, ALPN, RawExtensions
 type ParsedClientHello struct {
 	Version            uint16
 	Random             []byte
@@ -175,7 +200,6 @@ func parseALPN(data []byte, out *ParsedClientHello) {
 }
 
 // ========== 指纹比对用 ==========
-
 func matchUTLSClientHello(clientHelloBytes []byte, _ string, _ []string) (string, *GaseousClientHelloParams) {
 	parsed, err := parseClientHello(clientHelloBytes)
 	if err != nil {
@@ -263,8 +287,7 @@ func matchUTLSClientHello(clientHelloBytes []byte, _ string, _ []string) (string
 	return "", nil
 }
 
-// ========== ClientHello打包 ==========
-
+// ========== Pack/Unpack/Build ==========
 func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 	sni := c.serverName
 	alpn := c.config.NextProtos
@@ -321,7 +344,6 @@ func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 	return nil, errors.New("all compression failed")
 }
 
-// ========== ClientHello解包 ==========
 func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 	if len(data) < gaseousHelloHeaderSize+1 {
 		return nil, ErrGaseousTrunc
