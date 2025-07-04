@@ -1,12 +1,10 @@
 package tls
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 )
 
-// Serverhello unpacking
 func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
 	if len(data) < gaseousHelloHeaderSize {
 		return nil, ErrGaseousTrunc
@@ -40,7 +38,6 @@ func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	tmpl := gaseousTemplates.Templates[hdr.TemplID]
 	helloMsg := fillHelloTemplate(tmpl, decompressed)
 	return helloMsg, nil
