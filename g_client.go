@@ -21,7 +21,7 @@ var allUTLSIDs = []utls.ClientHelloID{
 	utls.HelloChrome_58, utls.HelloChrome_62, utls.HelloChrome_70, utls.HelloChrome_72,
 	utls.HelloChrome_83, utls.HelloChrome_87, utls.HelloChrome_96, utls.HelloChrome_100,
 	utls.HelloChrome_102, utls.HelloChrome_106_Shuffle, utls.HelloChrome_115_PQ, utls.HelloChrome_120,
-	utls.HelloChrome_120_PQ, utls.HelloChrome_131, utls.HelloChrome_133, utls.HelloFirefox_55,
+	utls.HelloChrome_120_PQ, utls.HelloChrome_131, utls.HelloFirefox_55,
 	utls.HelloFirefox_56, utls.HelloFirefox_63, utls.HelloFirefox_65, utls.HelloFirefox_99,
 	utls.HelloFirefox_102, utls.HelloFirefox_105, utls.HelloFirefox_120, utls.HelloIOS_11_1,
 	utls.HelloIOS_12_1, utls.HelloIOS_13, utls.HelloIOS_14, utls.HelloAndroid_11_OkHttp,
@@ -37,14 +37,6 @@ type GaseousClientHelloParams struct {
 	Random    []byte
 	SessionID []byte
 	Other     map[string][]byte // for extra params like KeyShare etc.
-}
-
-var gaseousTemplates = &GaseousTemplateRegistry{
-	Templates: make(map[uint16]*HelloTemplate),
-}
-
-func RegisterGaseousTemplate(id uint16, tmpl *HelloTemplate) {
-	gaseousTemplates.Templates[id] = tmpl
 }
 
 // =================== ClientHello Packing for Gaseous ===================
@@ -302,41 +294,6 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 		return nil, ErrGaseousTemplate
 	}
 	return fillHelloTemplate(tmpl, plain), nil
-}
-
-func decompressFlate(data []byte) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(data))
-	defer r.Close()
-	return io.ReadAll(r)
-}
-func decompressGzip(data []byte) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
-}
-func decompressBrotli(data []byte) ([]byte, error) {
-	r := brotli.NewReader(bytes.NewReader(data))
-	return io.ReadAll(r)
-}
-func decompressZstd(data []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer decoder.Close()
-	return io.ReadAll(decoder)
-}
-
-// =================== Template Filling and uTLS Hello Construction ===================
-
-func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
-	buf := make([]byte, len(tmpl.Serialized)+len(params))
-	copy(buf, tmpl.Serialized)
-	copy(buf[len(tmpl.Serialized):], params)
-	return buf
 }
 
 func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
