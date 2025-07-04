@@ -1,316 +1,349 @@
 package tls
 
 import (
-	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"io"
-	"sort"
+	"strings"
 
-	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
 	utls "github.com/refraction-networking/utls"
 )
 
-// =================== Gaseous ClientHello Protocol Constants ===================
-const (
-	recordTypeGaseousHello uint8 = 0xfe // Custom record type for Gaseous Hello
-	GaseousHelloMagic            = "GS"
-	GaseousHelloVersion   uint8  = 1
-	GaseousHelloTypeClient uint8 = 1
-	MinGaseousHelloLen          = 12 // header size + 1+
-)
-
-// Compression algorithms
-type GaseousHelloCompressAlgo uint8
-
-const (
-	GaseousCompressNone   GaseousHelloCompressAlgo = 0
-	GaseousCompressFlate  GaseousHelloCompressAlgo = 1
-	GaseousCompressGzip   GaseousHelloCompressAlgo = 2
-	GaseousCompressBrotli GaseousHelloCompressAlgo = 3
-	GaseousCompressZstd   GaseousHelloCompressAlgo = 4
-)
-
-var (
-	ErrGaseousMagic    = errors.New("gaseous: bad magic")
-	ErrGaseousVersion  = errors.New("gaseous: bad version")
-	ErrGaseousAlgo     = errors.New("gaseous: unsupported compression algorithm")
-	ErrGaseousTemplate = errors.New("gaseous: unknown template ID")
-	ErrGaseousTrunc    = errors.New("gaseous: truncated/invalid data")
-	ErrGaseousType     = errors.New("gaseous: unknown hello type")
-)
-
-// =================== Gaseous Hello Header Structure ===================
-type GaseousHelloHeader struct {
-	Magic     [2]byte // "GS"
-	Version   uint8   // protocol version
-	Algo      uint8   // compression algo
-	HelloType uint8   // 1: ClientHello, 2: ServerHello
-	TemplID   uint16  // template ID (see template registry)
-	DataLen   uint32  // compressed payload length
-}
-
-const gaseousHelloHeaderSize = 2 + 1 + 1 + 1 + 2 + 4 // = 11
-
-// =================== uTLS ClientHello Database Support ===================
-
-// All supported ClientHelloIDs (for matching)
-var allUTLSIDs = []utls.ClientHelloID{
-	utls.HelloChrome_58, utls.HelloChrome_62, utls.HelloChrome_70, utls.HelloChrome_72,
-	utls.HelloChrome_83, utls.HelloChrome_87, utls.HelloChrome_96, utls.HelloChrome_100,
-	utls.HelloChrome_102, utls.HelloChrome_106_Shuffle, utls.HelloChrome_115_PQ, utls.HelloChrome_120,
-	utls.HelloChrome_120_PQ, utls.HelloChrome_131, utls.HelloChrome_133, utls.HelloFirefox_55,
-	utls.HelloFirefox_56, utls.HelloFirefox_63, utls.HelloFirefox_65, utls.HelloFirefox_99,
-	utls.HelloFirefox_102, utls.HelloFirefox_105, utls.HelloFirefox_120, utls.HelloIOS_11_1,
-	utls.HelloIOS_12_1, utls.HelloIOS_13, utls.HelloIOS_14, utls.HelloAndroid_11_OkHttp,
-	utls.HelloEdge_85, utls.HelloEdge_106, utls.HelloSafari_16_0, utls.Hello360_7_5, utls.Hello360_11_0,
-	utls.HelloQQ_11_1, utls.HelloChrome_100_PSK, utls.HelloChrome_112_PSK_Shuf,
-	utls.HelloChrome_114_Padding_PSK_Shuf, utls.HelloChrome_115_PQ_PSK,
-}
-
+// ========== 指纹参数结构 ==========
 type GaseousClientHelloParams struct {
-	SpecType  string            // e.g. "HelloChrome_120"
+	SpecType  string            // uTLS 指纹名
 	SNI       string
 	ALPN      []string
 	Random    []byte
 	SessionID []byte
-	Other     map[string][]byte // for extra params like KeyShare etc.
+	Other     map[string][]byte // 扩展参数预留
 }
 
-// =================== ClientHello Template/Registry (for fallback) ===================
-type HelloTemplate struct {
-	Serialized []byte // Minimal template body, or marshaled handshake with placeholders
+// ========== uTLS 指纹集 ==========
+var allUTLSIDs = []utls.ClientHelloID{
+	utls.HelloChrome_58, utls.HelloChrome_62, utls.HelloChrome_70, utls.HelloChrome_72,
+	utls.HelloChrome_83, utls.HelloChrome_87, utls.HelloChrome_96, utls.HelloChrome_100,
+	utls.HelloChrome_102, utls.HelloChrome_106_Shuffle, utls.HelloChrome_115_PQ, utls.HelloChrome_120,
+	utls.HelloChrome_120_PQ, utls.HelloChrome_131, utls.HelloFirefox_55, utls.HelloFirefox_56,
+	utls.HelloFirefox_63, utls.HelloFirefox_65, utls.HelloFirefox_99, utls.HelloFirefox_102,
+	utls.HelloFirefox_105, utls.HelloFirefox_120, utls.HelloIOS_11_1, utls.HelloIOS_12_1,
+	utls.HelloIOS_13, utls.HelloIOS_14, utls.HelloAndroid_11_OkHttp, utls.HelloEdge_85,
+	utls.HelloEdge_106, utls.HelloSafari_16_0, utls.Hello360_7_5, utls.Hello360_11_0,
+	utls.HelloQQ_11_1, utls.HelloChrome_100_PSK, utls.HelloChrome_112_PSK_Shuf,
+	utls.HelloChrome_114_Padding_PSK_Shuf, utls.HelloChrome_115_PQ_PSK,
 }
 
-type GaseousTemplateRegistry struct {
-	Templates map[uint16]*HelloTemplate
+// ========== ClientHello 参数字段完整解析 ==========
+
+type ParsedClientHello struct {
+	Version            uint16
+	Random             []byte
+	SessionID          []byte
+	CipherSuites       []uint16
+	CompressionMethods []byte
+	SNI                string
+	ALPN               []string
+	Extensions         map[uint16][]byte // raw extension data
 }
 
-var gaseousTemplates = &GaseousTemplateRegistry{
-	Templates: make(map[uint16]*HelloTemplate),
-}
-
-func RegisterGaseousTemplate(id uint16, tmpl *HelloTemplate) {
-	gaseousTemplates.Templates[id] = tmpl
-}
-
-// =================== ClientHello Packing for Gaseous ===================
-
-// Try to match a ClientHello to uTLS known fingerprints.
-// If match, returns uTLS ID and params for reconstruct; otherwise, returns nil.
-func matchUTLSClientHello(clientHelloBytes []byte, sni string, alpn []string) (string, *GaseousClientHelloParams) {
-	bestMatch := ""
-	var params *GaseousClientHelloParams
-	bestScore := 0
-
-	// Parse the ClientHello (must be a valid handshake message)
-	chMsg := &utls.ClientHelloMsg{}
-	if !chMsg.Unmarshal(clientHelloBytes) {
-		return "", nil // parse fail, fallback to compression
+func parseClientHello(data []byte) (*ParsedClientHello, error) {
+	// TLS record layer header: type(1) + ver(2) + len(2) = 5
+	// Handshake header: type(1) + len(3) = 4
+	if len(data) < 9 {
+		return nil, errors.New("too short")
 	}
+	// Skip record header if present
+	offset := 0
+	if data[0] == 0x16 && len(data) > 5 && (data[1] == 0x03 && (data[2] >= 0x01 && data[2] <= 0x04)) {
+		// Record header found
+		recordLen := int(binary.BigEndian.Uint16(data[3:5]))
+		if len(data) < 5+recordLen {
+			return nil, errors.New("truncated TLS record")
+		}
+		offset = 5
+	}
+	hs := data[offset:]
+	if len(hs) < 4 {
+		return nil, errors.New("truncated handshake")
+	}
+	if hs[0] != 0x01 { // ClientHello
+		return nil, errors.New("not clienthello")
+	}
+	hsLen := int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
+	if len(hs)-4 < hsLen {
+		return nil, errors.New("truncated handshake body")
+	}
+	body := hs[4 : 4+hsLen]
+	out := &ParsedClientHello{
+		Extensions: make(map[uint16][]byte),
+	}
+	// Version
+	if len(body) < 2 {
+		return nil, errors.New("truncated version")
+	}
+	out.Version = binary.BigEndian.Uint16(body[:2])
+	i := 2
+	// Random
+	if len(body[i:]) < 32 {
+		return nil, errors.New("truncated random")
+	}
+	out.Random = append([]byte{}, body[i:i+32]...)
+	i += 32
+	// SessionID
+	if len(body[i:]) < 1 {
+		return nil, errors.New("truncated sessionid len")
+	}
+	sidLen := int(body[i])
+	i++
+	if len(body[i:]) < sidLen {
+		return nil, errors.New("truncated sessionid")
+	}
+	out.SessionID = append([]byte{}, body[i:i+sidLen]...)
+	i += sidLen
+	// CipherSuites
+	if len(body[i:]) < 2 {
+		return nil, errors.New("truncated ciphersuites len")
+	}
+	csLen := int(binary.BigEndian.Uint16(body[i:]))
+	i += 2
+	if len(body[i:]) < csLen || csLen%2 != 0 {
+		return nil, errors.New("truncated/invalid ciphersuites")
+	}
+	out.CipherSuites = make([]uint16, csLen/2)
+	for j := 0; j < csLen/2; j++ {
+		out.CipherSuites[j] = binary.BigEndian.Uint16(body[i : i+2])
+		i += 2
+	}
+	// CompressionMethods
+	if len(body[i:]) < 1 {
+		return nil, errors.New("truncated compression methods len")
+	}
+	compLen := int(body[i])
+	i++
+	if len(body[i:]) < compLen {
+		return nil, errors.New("truncated compression methods")
+	}
+	out.CompressionMethods = append([]byte{}, body[i:i+compLen]...)
+	i += compLen
+	// Extensions (if any)
+	if i == len(body) {
+		return out, nil // no extensions
+	}
+	if len(body[i:]) < 2 {
+		return nil, errors.New("truncated extensions len")
+	}
+	extLen := int(binary.BigEndian.Uint16(body[i:]))
+	i += 2
+	if len(body[i:]) < extLen {
+		return nil, errors.New("truncated extensions body")
+	}
+	exts := body[i : i+extLen]
+	ei := 0
+	for ei+4 <= len(exts) {
+		extType := binary.BigEndian.Uint16(exts[ei:])
+		extL := int(binary.BigEndian.Uint16(exts[ei+2:]))
+		ei += 4
+		if ei+extL > len(exts) {
+			break
+		}
+		out.Extensions[extType] = exts[ei : ei+extL]
+		// SNI (0x00 0x00)
+		if extType == 0x0000 {
+			parseSNI(exts[ei:ei+extL], out)
+		}
+		// ALPN (0x00 0x10)
+		if extType == 0x0010 {
+			parseALPN(exts[ei:ei+extL], out)
+		}
+		ei += extL
+	}
+	return out, nil
+}
+
+func parseSNI(data []byte, out *ParsedClientHello) {
+	if len(data) < 2 {
+		return
+	}
+	listLen := int(binary.BigEndian.Uint16(data[:2]))
+	i := 2
+	for i+3 <= len(data) && i+listLen <= len(data) {
+		typ := data[i]
+		nameLen := int(binary.BigEndian.Uint16(data[i+1:]))
+		i += 3
+		if typ == 0 && i+nameLen <= len(data) {
+			out.SNI = string(data[i : i+nameLen])
+			return
+		}
+		i += nameLen
+	}
+}
+
+func parseALPN(data []byte, out *ParsedClientHello) {
+	if len(data) < 2 {
+		return
+	}
+	li := 2
+	alpnLen := int(binary.BigEndian.Uint16(data[:2]))
+	for li < len(data) && li-2 < alpnLen {
+		if li >= len(data) {
+			break
+		}
+		l := int(data[li])
+		li++
+		if li+l > len(data) {
+			break
+		}
+		out.ALPN = append(out.ALPN, string(data[li:li+l]))
+		li += l
+	}
+}
+
+// ========== 指纹比对用 ==========
+func matchUTLSClientHello(clientHelloBytes []byte, _ string, _ []string) (string, *GaseousClientHelloParams) {
+	parsed, err := parseClientHello(clientHelloBytes)
+	if err != nil {
+		return "", nil
+	}
+	bestMatch := ""
+	bestScore := 0
+	var params *GaseousClientHelloParams
 
 	for _, id := range allUTLSIDs {
 		spec, err := utls.UTLSIdToSpec(id)
 		if err != nil {
 			continue
 		}
-		score := compareClientHelloSpec(chMsg, &spec, sni, alpn)
+		score := 0
+
+		// CipherSuites (顺序相关)
+		if len(parsed.CipherSuites) > 0 && len(spec.CipherSuites) > 0 {
+			match := 0
+			for i := range parsed.CipherSuites {
+				if i < len(spec.CipherSuites) && parsed.CipherSuites[i] == spec.CipherSuites[i] {
+					match++
+				}
+			}
+			score += match * 4
+		}
+		// CompressionMethods
+		if len(parsed.CompressionMethods) > 0 && len(spec.CompressionMethods) > 0 {
+			equal := true
+			if len(parsed.CompressionMethods) != len(spec.CompressionMethods) {
+				equal = false
+			} else {
+				for i := range parsed.CompressionMethods {
+					if parsed.CompressionMethods[i] != spec.CompressionMethods[i] {
+						equal = false
+						break
+					}
+				}
+			}
+			if equal {
+				score += 8
+			}
+		}
+		// ALPN
+		if len(parsed.ALPN) > 0 {
+			alpnMatch := 0
+			for _, ext := range spec.Extensions {
+				if e, ok := ext.(*utls.ALPNExtension); ok {
+					for _, proto := range parsed.ALPN {
+						for _, want := range e.AlpnProtocols {
+							if proto == want {
+								alpnMatch++
+							}
+						}
+					}
+				}
+			}
+			score += alpnMatch * 4
+		}
+		// SNI
+		if parsed.SNI != "" {
+			for _, ext := range spec.Extensions {
+				if _, ok := ext.(*utls.SNIExtension); ok {
+					score += 3
+					break
+				}
+			}
+		}
 		if score > bestScore {
 			bestScore = score
 			bestMatch = id.Str()
 			params = &GaseousClientHelloParams{
 				SpecType:  bestMatch,
-				SNI:       sni,
-				ALPN:      alpn,
-				Random:    append([]byte(nil), chMsg.Random...),
-				SessionID: append([]byte(nil), chMsg.SessionId...),
+				SNI:       parsed.SNI,
+				ALPN:      parsed.ALPN,
+				Random:    parsed.Random,
+				SessionID: parsed.SessionID,
 				Other:     make(map[string][]byte),
 			}
 		}
 	}
-	if bestScore >= 50 && bestMatch != "" && params != nil {
+	if bestScore >= 10 && bestMatch != "" && params != nil {
 		return bestMatch, params
 	}
 	return "", nil
 }
 
-// compareClientHelloSpec returns a score (0-100) of how well this ClientHello matches the spec.
-// Higher score means better match. You can tune weights as needed.
-func compareClientHelloSpec(msg *utls.ClientHelloMsg, spec *utls.ClientHelloSpec, sni string, alpn []string) int {
-	score := 0
-	if len(msg.CipherSuites) > 0 && len(spec.CipherSuites) > 0 {
-		overlap := 0
-		for _, x := range msg.CipherSuites {
-			for _, y := range spec.CipherSuites {
-				if x == y {
-					overlap++
-				}
-			}
-		}
-		score += overlap * 3
-	}
-	if len(msg.CompressionMethods) > 0 && len(spec.CompressionMethods) > 0 {
-		if bytes.Equal(msg.CompressionMethods, spec.CompressionMethods) {
-			score += 8
-		}
-	}
-	// ALPN overlap
-	if len(alpn) > 0 && len(spec.Extensions) > 0 {
-		var specALPN []string
-		for _, ext := range spec.Extensions {
-			if e, ok := ext.(*utls.ALPNExtension); ok {
-				specALPN = append(specALPN, e.AlpnProtocols...)
-			}
-		}
-		match := 0
-		for _, proto := range alpn {
-			for _, sproto := range specALPN {
-				if proto == sproto {
-					match++
-				}
-			}
-		}
-		score += match * 4
-	}
-	// SNI match
-	if sni != "" {
-		for _, ext := range spec.Extensions {
-			if e, ok := ext.(*utls.SNIExtension); ok && e.ServerName == sni {
-				score += 10
-			}
-		}
-	}
-	// Extension types overlap
-	var msgExts, specExts []uint16
-	for _, e := range msg.Extensions {
-		msgExts = append(msgExts, e.Type())
-	}
-	for _, e := range spec.Extensions {
-		specExts = append(specExts, e.Type())
-	}
-	sort.Slice(msgExts, func(i, j int) bool { return msgExts[i] < msgExts[j] })
-	sort.Slice(specExts, func(i, j int) bool { return specExts[i] < specExts[j] })
-	commonExt := 0
-	i, j := 0, 0
-	for i < len(msgExts) && j < len(specExts) {
-		if msgExts[i] == specExts[j] {
-			commonExt++
-			i++
-			j++
-		} else if msgExts[i] < specExts[j] {
-			i++
-		} else {
-			j++
-		}
-	}
-	score += commonExt * 2
-
-	// Random and SessionId length
-	if len(msg.Random) == 32 {
-		score += 2
-	}
-	if len(msg.SessionId) == 32 || len(msg.SessionId) == 0 {
-		score += 2
-	}
-	return score
-}
-
-// PackClientHelloGaseous: Packs the ClientHello for transmission.
-// If can match uTLS, use structured params. If not, compress raw bytes.
+// ========== Pack/Unpack/Build ==========
 func PackClientHelloGaseous(c *Conn) ([]byte, error) {
-	// Retrieve SNI/ALPN if available
 	sni := c.serverName
 	alpn := c.config.NextProtos
-
-	// Raw ClientHello bytes: should be in c.hand
 	clientHelloBytes := c.hand.Bytes()
 
-	// First: Try to match uTLS fingerprint
+	// 支持所有压缩算法
+	compressFuncs := []struct {
+		algo GaseousHelloCompressAlgo
+		fn   func([]byte) ([]byte, error)
+	}{
+		{GaseousCompressFlate, compressFlate},
+		{GaseousCompressGzip, compressGzip},
+		{GaseousCompressBrotli, compressBrotli},
+		{GaseousCompressZstd, compressZstd},
+		{GaseousCompressLZ4, compressLZ4},
+		{GaseousCompressXZ, compressXZ},
+		{GaseousCompressLZ4Block, compressLZ4Block},
+	}
+
 	if specStr, params := matchUTLSClientHello(clientHelloBytes, sni, alpn); specStr != "" {
-		// Encode params as json and compress with flate
 		paramBytes, err := json.Marshal(params)
 		if err != nil {
 			return nil, err
 		}
-		compressed, err := compressFlate(paramBytes)
-		if err != nil {
-			return nil, err
+		for _, cfn := range compressFuncs {
+			comp, err := cfn.fn(paramBytes)
+			if err == nil {
+				header := make([]byte, gaseousHelloHeaderSize)
+				copy(header[:2], []byte(GaseousHelloMagic))
+				header[2] = GaseousHelloVersion
+				header[3] = byte(cfn.algo)
+				header[4] = GaseousHelloTypeClient
+				binary.BigEndian.PutUint16(header[5:7], 0xffff)
+				binary.BigEndian.PutUint32(header[7:11], uint32(len(comp)))
+				return append([]byte{recordTypeGaseousHello}, append(header, comp...)...), nil
+			}
 		}
-		// Prepare header
-		header := make([]byte, gaseousHelloHeaderSize)
-		copy(header[:2], []byte(GaseousHelloMagic))
-		header[2] = GaseousHelloVersion
-		header[3] = byte(GaseousCompressFlate)
-		header[4] = GaseousHelloTypeClient
-		binary.BigEndian.PutUint16(header[5:7], 0xffff) // templateID=0xffff means "uTLS param"
-		binary.BigEndian.PutUint32(header[7:11], uint32(len(compressed)))
-		// Prepend recordType
-		return append([]byte{recordTypeGaseousHello}, append(header, compressed...)...), nil
+		return nil, errors.New("all compression failed")
 	}
 
-	// Fallback: Compress original ClientHello using Brotli
-	compressed, err := compressBrotli(clientHelloBytes)
-	if err != nil {
-		return nil, err
+	for _, cfn := range compressFuncs {
+		comp, err := cfn.fn(clientHelloBytes)
+		if err == nil {
+			header := make([]byte, gaseousHelloHeaderSize)
+			copy(header[:2], []byte(GaseousHelloMagic))
+			header[2] = GaseousHelloVersion
+			header[3] = byte(cfn.algo)
+			header[4] = GaseousHelloTypeClient
+			binary.BigEndian.PutUint16(header[5:7], 0)
+			binary.BigEndian.PutUint32(header[7:11], uint32(len(comp)))
+			return append([]byte{recordTypeGaseousHello}, append(header, comp...)...), nil
+		}
 	}
-
-	// Prepare header
-	header := make([]byte, gaseousHelloHeaderSize)
-	copy(header[:2], []byte(GaseousHelloMagic))
-	header[2] = GaseousHelloVersion
-	header[3] = byte(GaseousCompressBrotli)
-	header[4] = GaseousHelloTypeClient
-	binary.BigEndian.PutUint16(header[5:7], 0) // templateID 0 means raw
-	binary.BigEndian.PutUint32(header[7:11], uint32(len(compressed)))
-
-	// Prepend recordType
-	return append([]byte{recordTypeGaseousHello}, append(header, compressed...)...), nil
+	return nil, errors.New("all compression failed")
 }
 
-// Compression helpers
-func compressBrotli(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	w := brotli.NewWriterLevel(&buf, brotli.BestCompression)
-	_, err := w.Write(data)
-	if err != nil {
-		w.Close()
-		return nil, err
-	}
-	w.Close()
-	return buf.Bytes(), nil
-}
-func compressFlate(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	w, _ := flate.NewWriter(&buf, flate.BestCompression)
-	_, err := w.Write(data)
-	w.Close()
-	return buf.Bytes(), err
-}
-func compressGzip(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
-	_, err := w.Write(data)
-	w.Close()
-	return buf.Bytes(), err
-}
-func compressZstd(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	enc, err := zstd.NewWriter(&buf)
-	if err != nil {
-		return nil, err
-	}
-	_, err = enc.Write(data)
-	enc.Close()
-	return buf.Bytes(), err
-}
-
-// =================== Gaseous ClientHello Decoding (for proxy/server) ===================
 func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
-	// Must skip recordType (1 byte)
 	if len(data) < gaseousHelloHeaderSize+1 {
 		return nil, ErrGaseousTrunc
 	}
@@ -337,20 +370,6 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 	}
 	compressed := data[gaseousHelloHeaderSize : gaseousHelloHeaderSize+int(hdr.DataLen)]
 
-	// If TemplID==0xffff, this is a uTLS param struct, not a template
-	if hdr.TemplID == 0xffff {
-		plain, err := decompressFlate(compressed)
-		if err != nil {
-			return nil, err
-		}
-		var params GaseousClientHelloParams
-		if err := json.Unmarshal(plain, &params); err != nil {
-			return nil, err
-		}
-		return buildUTLSClientHello(&params)
-	}
-
-	// Otherwise, decompress and fill template
 	var plain []byte
 	var err error
 	switch GaseousHelloCompressAlgo(hdr.Algo) {
@@ -364,13 +383,25 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 		plain, err = decompressBrotli(compressed)
 	case GaseousCompressZstd:
 		plain, err = decompressZstd(compressed)
+	case GaseousCompressLZ4:
+		plain, err = decompressLZ4(compressed)
+	case GaseousCompressXZ:
+		plain, err = decompressXZ(compressed)
+	case GaseousCompressLZ4Block:
+		plain, err = decompressLZ4Block(compressed)
 	default:
 		return nil, ErrGaseousAlgo
 	}
 	if err != nil {
 		return nil, err
 	}
-
+	if hdr.TemplID == 0xffff {
+		var params GaseousClientHelloParams
+		if err := json.Unmarshal(plain, &params); err != nil {
+			return nil, err
+		}
+		return buildUTLSClientHello(&params)
+	}
 	tmpl := gaseousTemplates.Templates[hdr.TemplID]
 	if tmpl == nil {
 		return nil, ErrGaseousTemplate
@@ -378,48 +409,12 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 	return fillHelloTemplate(tmpl, plain), nil
 }
 
-func decompressFlate(data []byte) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(data))
-	defer r.Close()
-	return io.ReadAll(r)
-}
-func decompressGzip(data []byte) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
-}
-func decompressBrotli(data []byte) ([]byte, error) {
-	r := brotli.NewReader(bytes.NewReader(data))
-	return io.ReadAll(r)
-}
-func decompressZstd(data []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer decoder.Close()
-	return io.ReadAll(decoder)
-}
-
-// =================== Template Filling and uTLS Hello Construction ===================
-
-// fillHelloTemplate: for fallback, just concat (demo)
-func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
-	buf := make([]byte, len(tmpl.Serialized)+len(params))
-	copy(buf, tmpl.Serialized)
-	copy(buf[len(tmpl.Serialized):], params)
-	return buf
-}
-
+// ========== uTLS指纹重建 ==========
 func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
-	// Find uTLS ClientHelloID by string
 	var id utls.ClientHelloID
 	found := false
 	for _, x := range allUTLSIDs {
-		if x.Str() == params.SpecType {
+		if strings.EqualFold(x.Str(), params.SpecType) {
 			id = x
 			found = true
 			break
@@ -435,7 +430,6 @@ func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Apply params to spec
 	if params.SNI != "" {
 		for _, ext := range spec.Extensions {
 			if e, ok := ext.(*utls.SNIExtension); ok {
@@ -450,22 +444,17 @@ func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
 			}
 		}
 	}
-	if len(params.Random) == 32 {
-		spec.GetRandom = func() []byte { return params.Random }
-	}
-	if len(params.SessionID) > 0 {
-		spec.GetSessionID = func() []byte { return params.SessionID }
-	}
-	// Any extra parameters (future)
-	// Fill other fields as needed for maximum fidelity
-
+	// uTLS随机字段不支持外部注入，后续可补丁
 	if err := uc.ApplyPreset(&spec); err != nil {
 		return nil, err
 	}
-
 	hello := uc.HandshakeState.Hello
 	if hello == nil {
 		return nil, errors.New("failed to build ClientHello")
 	}
-	return hello.Marshal(), nil
+	helloBytes, err := hello.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	return helloBytes, nil
 }
