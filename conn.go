@@ -116,6 +116,9 @@ type Conn struct {
 	activeCall int32
 
 	tmp [16]byte
+	
+	gaseousHelloSent     bool
+        gaseousHelloReceived bool
 }
 
 // Access to net.Conn methods.
@@ -157,6 +160,12 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 // TLS session.
 func (c *Conn) NetConn() net.Conn {
 	return c.conn
+}
+
+func (c *Conn) consumeHello(hello []byte) error {
+    c.hand.Reset()         // 清空 handshake buffer
+    c.hand.Write(hello)    // 写入完整 hello 消息
+    return nil
 }
 
 // A halfConn represents one direction of the record layer
@@ -1104,8 +1113,10 @@ var (
 // must be set for both Read and Write before Write is called when the handshake
 // has not yet completed. See SetDeadline, SetReadDeadline, and
 // SetWriteDeadline.
+// Write writes application data to the connection.
+// If Gaseous mode is enabled, the first record sent is a compressed Gaseous ClientHello.
+// Otherwise, standard TLS handshake/data logic applies.
 func (c *Conn) Write(b []byte) (int, error) {
-	// interlock with Close below
 	for {
 		x := atomic.LoadInt32(&c.activeCall)
 		if x&1 != 0 {
@@ -1116,6 +1127,19 @@ func (c *Conn) Write(b []byte) (int, error) {
 		}
 	}
 	defer atomic.AddInt32(&c.activeCall, -2)
+
+	// Gaseous: send compressed ClientHello before handshake if in gaseous mode
+	if c.config != nil && c.config.GaseousEnabled && !c.gaseousHelloSent {
+		helloCompressed, err := PackClientHelloGaseous(c)
+		if err != nil {
+			return 0, fmt.Errorf("gaseous: pack client hello failed: %w", err)
+		}
+		n, err := c.writeRecordLocked(recordTypeGaseousHello, helloCompressed)
+		if err != nil {
+			return n, err
+		}
+		c.gaseousHelloSent = true
+	}
 
 	if err := c.Handshake(); err != nil {
 		return 0, err
@@ -1135,15 +1159,6 @@ func (c *Conn) Write(b []byte) (int, error) {
 	if c.closeNotifySent {
 		return 0, errShutdown
 	}
-
-	// TLS 1.0 is susceptible to a chosen-plaintext
-	// attack when using block mode ciphers due to predictable IVs.
-	// This can be prevented by splitting each Application Data
-	// record into two records, effectively randomizing the IV.
-	//
-	// https://www.openssl.org/~bodo/tls-cbc.txt
-	// https://bugzilla.mozilla.org/show_bug.cgi?id=665814
-	// https://www.imperialviolet.org/2012/01/15/beastfollowup.html
 
 	var m int
 	if len(b) > 1 && c.vers == VersionTLS10 {
@@ -1268,18 +1283,35 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 // must be set for both Read and Write before Read is called when the handshake
 // has not yet completed. See SetDeadline, SetReadDeadline, and
 // SetWriteDeadline.
+// Read reads data from the connection.
+// If Gaseous mode is enabled, will first try to detect/parse a compressed Gaseous ClientHello/ServerHello.
 func (c *Conn) Read(b []byte) (int, error) {
 	if err := c.Handshake(); err != nil {
 		return 0, err
 	}
 	if len(b) == 0 {
-		// Put this after Handshake, in case people were calling
-		// Read(nil) for the side effect of the Handshake.
 		return 0, nil
 	}
 
 	c.in.Lock()
 	defer c.in.Unlock()
+
+	// Gaseous: receive and unpack ClientHello/ServerHello before handshake data if in gaseous mode
+	if c.config != nil && c.config.GaseousEnabled && !c.gaseousHelloReceived {
+		for c.rawInput.Len() < MinGaseousHelloLen {
+			if err := c.readRecord(); err != nil {
+				return 0, err
+			}
+		}
+		gHello, err := UnpackClientHelloGaseous(c.rawInput.Bytes())
+		if err != nil {
+			return 0, fmt.Errorf("gaseous: unpack hello failed: %w", err)
+		}
+		if err := c.consumeHello(gHello); err != nil {
+			return 0, err
+		}
+		c.gaseousHelloReceived = true
+	}
 
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {
@@ -1293,18 +1325,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 	}
 
 	n, _ := c.input.Read(b)
-
-	// If a close-notify alert is waiting, read it so that we can return (n,
-	// EOF) instead of (n, nil), to signal to the HTTP response reading
-	// goroutine that the connection is now closed. This eliminates a race
-	// where the HTTP response reading goroutine would otherwise not observe
-	// the EOF until its next read, by which time a client goroutine might
-	// have already tried to reuse the HTTP connection for a new request.
-	// See https://golang.org/cl/76400046 and https://golang.org/issue/3514
 	if n != 0 && c.input.Len() == 0 && c.rawInput.Len() > 0 &&
 		recordType(c.rawInput.Bytes()[0]) == recordTypeAlert {
 		if err := c.readRecord(); err != nil {
-			return n, err // will be io.EOF on closeNotify
+			return n, err
 		}
 	}
 
