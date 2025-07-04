@@ -2,7 +2,6 @@ package tls
 
 import (
 	"encoding/binary"
-	"errors"
 )
 
 func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
@@ -77,7 +76,9 @@ func UnpackAnyGaseousHello(data []byte) (helloType uint8, helloMsg []byte, err e
 	helloType = data[4]
 	switch helloType {
 	case GaseousHelloTypeClient:
-		return 1, nil, errors.New("not implemented: ClientHello unpack on server side")
+		// 客户端 Hello 解包，调用 UnpackClientHelloGaseous
+		hello, err := UnpackClientHelloGaseous(data)
+		return 1, hello, err
 	case GaseousHelloTypeServer:
 		hello, err := UnpackServerHelloGaseous(data)
 		return 2, hello, err
