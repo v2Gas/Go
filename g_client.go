@@ -15,50 +15,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// =================== Gaseous ClientHello Protocol Constants ===================
-const (
-	recordTypeGaseousHello uint8 = 0xfe // Custom record type for Gaseous Hello
-	GaseousHelloMagic            = "GS"
-	GaseousHelloVersion   uint8  = 1
-	GaseousHelloTypeClient uint8 = 1
-	MinGaseousHelloLen          = 12 // header size + 1+
-)
-
-// Compression algorithms
-type GaseousHelloCompressAlgo uint8
-
-const (
-	GaseousCompressNone   GaseousHelloCompressAlgo = 0
-	GaseousCompressFlate  GaseousHelloCompressAlgo = 1
-	GaseousCompressGzip   GaseousHelloCompressAlgo = 2
-	GaseousCompressBrotli GaseousHelloCompressAlgo = 3
-	GaseousCompressZstd   GaseousHelloCompressAlgo = 4
-)
-
-var (
-	ErrGaseousMagic    = errors.New("gaseous: bad magic")
-	ErrGaseousVersion  = errors.New("gaseous: bad version")
-	ErrGaseousAlgo     = errors.New("gaseous: unsupported compression algorithm")
-	ErrGaseousTemplate = errors.New("gaseous: unknown template ID")
-	ErrGaseousTrunc    = errors.New("gaseous: truncated/invalid data")
-	ErrGaseousType     = errors.New("gaseous: unknown hello type")
-)
-
-// =================== Gaseous Hello Header Structure ===================
-type GaseousHelloHeader struct {
-	Magic     [2]byte // "GS"
-	Version   uint8   // protocol version
-	Algo      uint8   // compression algo
-	HelloType uint8   // 1: ClientHello, 2: ServerHello
-	TemplID   uint16  // template ID (see template registry)
-	DataLen   uint32  // compressed payload length
-}
-
-const gaseousHelloHeaderSize = 2 + 1 + 1 + 1 + 2 + 4 // = 11
-
 // =================== uTLS ClientHello Database Support ===================
 
-// All supported ClientHelloIDs (for matching)
 var allUTLSIDs = []utls.ClientHelloID{
 	utls.HelloChrome_58, utls.HelloChrome_62, utls.HelloChrome_70, utls.HelloChrome_72,
 	utls.HelloChrome_83, utls.HelloChrome_87, utls.HelloChrome_96, utls.HelloChrome_100,
@@ -81,15 +39,6 @@ type GaseousClientHelloParams struct {
 	Other     map[string][]byte // for extra params like KeyShare etc.
 }
 
-// =================== ClientHello Template/Registry (for fallback) ===================
-type HelloTemplate struct {
-	Serialized []byte // Minimal template body, or marshaled handshake with placeholders
-}
-
-type GaseousTemplateRegistry struct {
-	Templates map[uint16]*HelloTemplate
-}
-
 var gaseousTemplates = &GaseousTemplateRegistry{
 	Templates: make(map[uint16]*HelloTemplate),
 }
@@ -100,17 +49,14 @@ func RegisterGaseousTemplate(id uint16, tmpl *HelloTemplate) {
 
 // =================== ClientHello Packing for Gaseous ===================
 
-// Try to match a ClientHello to uTLS known fingerprints.
-// If match, returns uTLS ID and params for reconstruct; otherwise, returns nil.
 func matchUTLSClientHello(clientHelloBytes []byte, sni string, alpn []string) (string, *GaseousClientHelloParams) {
 	bestMatch := ""
 	var params *GaseousClientHelloParams
 	bestScore := 0
 
-	// Parse the ClientHello (must be a valid handshake message)
 	chMsg := &utls.ClientHelloMsg{}
 	if !chMsg.Unmarshal(clientHelloBytes) {
-		return "", nil // parse fail, fallback to compression
+		return "", nil
 	}
 
 	for _, id := range allUTLSIDs {
@@ -138,8 +84,6 @@ func matchUTLSClientHello(clientHelloBytes []byte, sni string, alpn []string) (s
 	return "", nil
 }
 
-// compareClientHelloSpec returns a score (0-100) of how well this ClientHello matches the spec.
-// Higher score means better match. You can tune weights as needed.
 func compareClientHelloSpec(msg *utls.ClientHelloMsg, spec *utls.ClientHelloSpec, sni string, alpn []string) int {
 	score := 0
 	if len(msg.CipherSuites) > 0 && len(spec.CipherSuites) > 0 {
@@ -209,7 +153,6 @@ func compareClientHelloSpec(msg *utls.ClientHelloMsg, spec *utls.ClientHelloSpec
 	}
 	score += commonExt * 2
 
-	// Random and SessionId length
 	if len(msg.Random) == 32 {
 		score += 2
 	}
@@ -219,19 +162,12 @@ func compareClientHelloSpec(msg *utls.ClientHelloMsg, spec *utls.ClientHelloSpec
 	return score
 }
 
-// PackClientHelloGaseous: Packs the ClientHello for transmission.
-// If can match uTLS, use structured params. If not, compress raw bytes.
 func PackClientHelloGaseous(c *Conn) ([]byte, error) {
-	// Retrieve SNI/ALPN if available
 	sni := c.serverName
 	alpn := c.config.NextProtos
-
-	// Raw ClientHello bytes: should be in c.hand
 	clientHelloBytes := c.hand.Bytes()
 
-	// First: Try to match uTLS fingerprint
 	if specStr, params := matchUTLSClientHello(clientHelloBytes, sni, alpn); specStr != "" {
-		// Encode params as json and compress with flate
 		paramBytes, err := json.Marshal(params)
 		if err != nil {
 			return nil, err
@@ -240,34 +176,27 @@ func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Prepare header
 		header := make([]byte, gaseousHelloHeaderSize)
 		copy(header[:2], []byte(GaseousHelloMagic))
 		header[2] = GaseousHelloVersion
 		header[3] = byte(GaseousCompressFlate)
 		header[4] = GaseousHelloTypeClient
-		binary.BigEndian.PutUint16(header[5:7], 0xffff) // templateID=0xffff means "uTLS param"
+		binary.BigEndian.PutUint16(header[5:7], 0xffff)
 		binary.BigEndian.PutUint32(header[7:11], uint32(len(compressed)))
-		// Prepend recordType
 		return append([]byte{recordTypeGaseousHello}, append(header, compressed...)...), nil
 	}
 
-	// Fallback: Compress original ClientHello using Brotli
 	compressed, err := compressBrotli(clientHelloBytes)
 	if err != nil {
 		return nil, err
 	}
-
-	// Prepare header
 	header := make([]byte, gaseousHelloHeaderSize)
 	copy(header[:2], []byte(GaseousHelloMagic))
 	header[2] = GaseousHelloVersion
 	header[3] = byte(GaseousCompressBrotli)
 	header[4] = GaseousHelloTypeClient
-	binary.BigEndian.PutUint16(header[5:7], 0) // templateID 0 means raw
+	binary.BigEndian.PutUint16(header[5:7], 0)
 	binary.BigEndian.PutUint32(header[7:11], uint32(len(compressed)))
-
-	// Prepend recordType
 	return append([]byte{recordTypeGaseousHello}, append(header, compressed...)...), nil
 }
 
@@ -310,7 +239,6 @@ func compressZstd(data []byte) ([]byte, error) {
 
 // =================== Gaseous ClientHello Decoding (for proxy/server) ===================
 func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
-	// Must skip recordType (1 byte)
 	if len(data) < gaseousHelloHeaderSize+1 {
 		return nil, ErrGaseousTrunc
 	}
@@ -337,7 +265,6 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 	}
 	compressed := data[gaseousHelloHeaderSize : gaseousHelloHeaderSize+int(hdr.DataLen)]
 
-	// If TemplID==0xffff, this is a uTLS param struct, not a template
 	if hdr.TemplID == 0xffff {
 		plain, err := decompressFlate(compressed)
 		if err != nil {
@@ -350,7 +277,6 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 		return buildUTLSClientHello(&params)
 	}
 
-	// Otherwise, decompress and fill template
 	var plain []byte
 	var err error
 	switch GaseousHelloCompressAlgo(hdr.Algo) {
@@ -406,7 +332,6 @@ func decompressZstd(data []byte) ([]byte, error) {
 
 // =================== Template Filling and uTLS Hello Construction ===================
 
-// fillHelloTemplate: for fallback, just concat (demo)
 func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
 	buf := make([]byte, len(tmpl.Serialized)+len(params))
 	copy(buf, tmpl.Serialized)
@@ -415,7 +340,6 @@ func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
 }
 
 func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
-	// Find uTLS ClientHelloID by string
 	var id utls.ClientHelloID
 	found := false
 	for _, x := range allUTLSIDs {
@@ -435,7 +359,6 @@ func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Apply params to spec
 	if params.SNI != "" {
 		for _, ext := range spec.Extensions {
 			if e, ok := ext.(*utls.SNIExtension); ok {
@@ -456,8 +379,6 @@ func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
 	if len(params.SessionID) > 0 {
 		spec.GetSessionID = func() []byte { return params.SessionID }
 	}
-	// Any extra parameters (future)
-	// Fill other fields as needed for maximum fidelity
 
 	if err := uc.ApplyPreset(&spec); err != nil {
 		return nil, err
