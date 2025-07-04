@@ -2,16 +2,11 @@ package tls
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"io"
 	"sort"
 
-	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -159,74 +154,57 @@ func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 	alpn := c.config.NextProtos
 	clientHelloBytes := c.hand.Bytes()
 
+	// 优先尝试所有压缩算法（按算法号顺序依次尝试）
+	compressFuncs := []struct {
+		algo GaseousHelloCompressAlgo
+		fn   func([]byte) ([]byte, error)
+	}{
+		{GaseousCompressFlate,    compressFlate},
+		{GaseousCompressGzip,     compressGzip},
+		{GaseousCompressBrotli,   compressBrotli},
+		{GaseousCompressZstd,     compressZstd},
+		{GaseousCompressLZ4,      compressLZ4},
+		{GaseousCompressXZ,       compressXZ},
+		{GaseousCompressLZ4Block, compressLZ4Block},
+	}
+
+	// Try uTLS特征结构打包
 	if specStr, params := matchUTLSClientHello(clientHelloBytes, sni, alpn); specStr != "" {
 		paramBytes, err := json.Marshal(params)
 		if err != nil {
 			return nil, err
 		}
-		compressed, err := compressFlate(paramBytes)
-		if err != nil {
-			return nil, err
+		for _, cfn := range compressFuncs {
+			comp, err := cfn.fn(paramBytes)
+			if err == nil {
+				header := make([]byte, gaseousHelloHeaderSize)
+				copy(header[:2], []byte(GaseousHelloMagic))
+				header[2] = GaseousHelloVersion
+				header[3] = byte(cfn.algo)
+				header[4] = GaseousHelloTypeClient
+				binary.BigEndian.PutUint16(header[5:7], 0xffff)
+				binary.BigEndian.PutUint32(header[7:11], uint32(len(comp)))
+				return append([]byte{recordTypeGaseousHello}, append(header, comp...)...), nil
+			}
 		}
-		header := make([]byte, gaseousHelloHeaderSize)
-		copy(header[:2], []byte(GaseousHelloMagic))
-		header[2] = GaseousHelloVersion
-		header[3] = byte(GaseousCompressFlate)
-		header[4] = GaseousHelloTypeClient
-		binary.BigEndian.PutUint16(header[5:7], 0xffff)
-		binary.BigEndian.PutUint32(header[7:11], uint32(len(compressed)))
-		return append([]byte{recordTypeGaseousHello}, append(header, compressed...)...), nil
+		return nil, errors.New("all compression failed")
 	}
 
-	compressed, err := compressBrotli(clientHelloBytes)
-	if err != nil {
-		return nil, err
+	// Fallback: 压缩原始ClientHello，优先选择压缩得更好（按算法优先级）
+	for _, cfn := range compressFuncs {
+		comp, err := cfn.fn(clientHelloBytes)
+		if err == nil {
+			header := make([]byte, gaseousHelloHeaderSize)
+			copy(header[:2], []byte(GaseousHelloMagic))
+			header[2] = GaseousHelloVersion
+			header[3] = byte(cfn.algo)
+			header[4] = GaseousHelloTypeClient
+			binary.BigEndian.PutUint16(header[5:7], 0)
+			binary.BigEndian.PutUint32(header[7:11], uint32(len(comp)))
+			return append([]byte{recordTypeGaseousHello}, append(header, comp...)...), nil
+		}
 	}
-	header := make([]byte, gaseousHelloHeaderSize)
-	copy(header[:2], []byte(GaseousHelloMagic))
-	header[2] = GaseousHelloVersion
-	header[3] = byte(GaseousCompressBrotli)
-	header[4] = GaseousHelloTypeClient
-	binary.BigEndian.PutUint16(header[5:7], 0)
-	binary.BigEndian.PutUint32(header[7:11], uint32(len(compressed)))
-	return append([]byte{recordTypeGaseousHello}, append(header, compressed...)...), nil
-}
-
-// Compression helpers
-func compressBrotli(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	w := brotli.NewWriterLevel(&buf, brotli.BestCompression)
-	_, err := w.Write(data)
-	if err != nil {
-		w.Close()
-		return nil, err
-	}
-	w.Close()
-	return buf.Bytes(), nil
-}
-func compressFlate(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	w, _ := flate.NewWriter(&buf, flate.BestCompression)
-	_, err := w.Write(data)
-	w.Close()
-	return buf.Bytes(), err
-}
-func compressGzip(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
-	_, err := w.Write(data)
-	w.Close()
-	return buf.Bytes(), err
-}
-func compressZstd(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	enc, err := zstd.NewWriter(&buf)
-	if err != nil {
-		return nil, err
-	}
-	_, err = enc.Write(data)
-	enc.Close()
-	return buf.Bytes(), err
+	return nil, errors.New("all compression failed")
 }
 
 // =================== Gaseous ClientHello Decoding (for proxy/server) ===================
@@ -257,18 +235,6 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 	}
 	compressed := data[gaseousHelloHeaderSize : gaseousHelloHeaderSize+int(hdr.DataLen)]
 
-	if hdr.TemplID == 0xffff {
-		plain, err := decompressFlate(compressed)
-		if err != nil {
-			return nil, err
-		}
-		var params GaseousClientHelloParams
-		if err := json.Unmarshal(plain, &params); err != nil {
-			return nil, err
-		}
-		return buildUTLSClientHello(&params)
-	}
-
 	var plain []byte
 	var err error
 	switch GaseousHelloCompressAlgo(hdr.Algo) {
@@ -282,13 +248,25 @@ func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 		plain, err = decompressBrotli(compressed)
 	case GaseousCompressZstd:
 		plain, err = decompressZstd(compressed)
+	case GaseousCompressLZ4:
+		plain, err = decompressLZ4(compressed)
+	case GaseousCompressXZ:
+		plain, err = decompressXZ(compressed)
+	case GaseousCompressLZ4Block:
+		plain, err = decompressLZ4Block(compressed)
 	default:
 		return nil, ErrGaseousAlgo
 	}
 	if err != nil {
 		return nil, err
 	}
-
+	if hdr.TemplID == 0xffff {
+		var params GaseousClientHelloParams
+		if err := json.Unmarshal(plain, &params); err != nil {
+			return nil, err
+		}
+		return buildUTLSClientHello(&params)
+	}
 	tmpl := gaseousTemplates.Templates[hdr.TemplID]
 	if tmpl == nil {
 		return nil, ErrGaseousTemplate
