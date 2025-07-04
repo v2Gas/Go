@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 
-	// Optional: import only when these dependencies are present in your go.mod
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
@@ -16,72 +15,14 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
-// GaseousHelloCompressAlgo identifies the compression algorithm used for (Server/Client)Hello.
-type GaseousHelloCompressAlgo uint8
-
-const (
-	GaseousCompressNone     GaseousHelloCompressAlgo = 0
-	GaseousCompressFlate    GaseousHelloCompressAlgo = 1
-	GaseousCompressGzip     GaseousHelloCompressAlgo = 2
-	GaseousCompressBrotli   GaseousHelloCompressAlgo = 3
-	GaseousCompressZstd     GaseousHelloCompressAlgo = 4
-	GaseousCompressLZ4      GaseousHelloCompressAlgo = 5
-	GaseousCompressXZ       GaseousHelloCompressAlgo = 6
-	GaseousCompressLZ4Block GaseousHelloCompressAlgo = 7
-	// Add more as needed
-)
-
-const (
-	GaseousHelloMagic   = "GS"
-	GaseousHelloVersion = 1
-	GaseousHelloTypeClient = 1
-	GaseousHelloTypeServer = 2
-)
-
-// GaseousHelloHeader is the fixed header for compressed Hello messages.
-type GaseousHelloHeader struct {
-	Magic     [2]byte // "GS"
-	Version   uint8   // protocol version
-	Algo      uint8   // compression algo
-	HelloType uint8   // 1: ClientHello, 2: ServerHello
-	TemplID   uint16  // template ID (see template registry)
-	DataLen   uint32  // compressed payload length
-}
-
-// Size of the fixed header.
-const gaseousHelloHeaderSize = 2 + 1 + 1 + 1 + 2 + 4 // = 11
-
-var (
-	ErrGaseousMagic    = errors.New("gaseous: bad magic")
-	ErrGaseousVersion  = errors.New("gaseous: bad version")
-	ErrGaseousAlgo     = errors.New("gaseous: unsupported compression algorithm")
-	ErrGaseousTemplate = errors.New("gaseous: unknown template ID")
-	ErrGaseousTrunc    = errors.New("gaseous: truncated/invalid data")
-	ErrGaseousType     = errors.New("gaseous: unknown hello type")
-)
-
-// GaseousTemplateRegistry maps template IDs to minimal Hello templates.
-type GaseousTemplateRegistry struct {
-	Templates map[uint16]*HelloTemplate
-}
-
-// HelloTemplate is a minimal "skeleton" that can be filled by parameters.
-type HelloTemplate struct {
-	Serialized []byte // Minimal template body, or marshaled handshake with placeholders
-}
-
-// The main registry used by the server.
 var gaseousTemplates = &GaseousTemplateRegistry{
 	Templates: make(map[uint16]*HelloTemplate),
 }
 
-// RegisterGaseousTemplate registers a template for a given ID.
 func RegisterGaseousTemplate(id uint16, tmpl *HelloTemplate) {
 	gaseousTemplates.Templates[id] = tmpl
 }
 
-// UnpackServerHelloGaseous unpacks and decompresses the Gaseous ServerHello packet.
-// Returns the reconstructed ServerHello bytes.
 func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
 	if len(data) < gaseousHelloHeaderSize {
 		return nil, ErrGaseousTrunc
@@ -111,19 +52,16 @@ func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
 	}
 	compressed := data[gaseousHelloHeaderSize : gaseousHelloHeaderSize+int(hdr.DataLen)]
 
-	// Decompress
 	decompressed, err := gaseousDecompressData(compressed, GaseousHelloCompressAlgo(hdr.Algo))
 	if err != nil {
 		return nil, err
 	}
 
-	// Combine decompressed params with template
 	tmpl := gaseousTemplates.Templates[hdr.TemplID]
 	helloMsg := fillHelloTemplate(tmpl, decompressed)
 	return helloMsg, nil
 }
 
-// gaseousDecompressData handles all supported algorithms and returns the decompressed data.
 func gaseousDecompressData(data []byte, algo GaseousHelloCompressAlgo) ([]byte, error) {
 	switch algo {
 	case GaseousCompressNone:
@@ -192,8 +130,6 @@ func decompressXZ(data []byte) ([]byte, error) {
 }
 
 func decompressLZ4Block(data []byte) ([]byte, error) {
-	// This assumes the uncompressed size is stored in the first 4 bytes (big endian)
-	// followed by the lz4block-compressed data.
 	if len(data) < 4 {
 		return nil, errors.New("lz4block: truncated input")
 	}
@@ -206,17 +142,13 @@ func decompressLZ4Block(data []byte) ([]byte, error) {
 	return dst[:n], nil
 }
 
-// fillHelloTemplate reconstructs the Hello bytes from the template and parameters.
 func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
-	// For maximal compression, assume template is a minimal byte stream with placeholders.
-	// For this demo, simply append params to the template.
 	buf := make([]byte, len(tmpl.Serialized)+len(params))
 	copy(buf, tmpl.Serialized)
 	copy(buf[len(tmpl.Serialized):], params)
 	return buf
 }
 
-// Optionally set default decompression algorithm for server logic.
 var gaseousDecompressAlgo = GaseousCompressFlate
 
 func SetGaseousDecompressAlgo(algo GaseousHelloCompressAlgo) {
@@ -227,7 +159,6 @@ func IsGaseousHello(data []byte) bool {
 	return len(data) >= 2 && string(data[:2]) == GaseousHelloMagic
 }
 
-// For demo/test: decompress any hello (client or server), returning type.
 func UnpackAnyGaseousHello(data []byte) (helloType uint8, helloMsg []byte, err error) {
 	if len(data) < gaseousHelloHeaderSize {
 		return 0, nil, ErrGaseousTrunc
