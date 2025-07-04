@@ -82,7 +82,7 @@ func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
 	return buf
 }
 
-// Compression functions
+// --- Compression functions ---
 
 func compressFlate(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
@@ -139,16 +139,18 @@ func compressXZ(data []byte) ([]byte, error) {
 }
 
 func compressLZ4Block(data []byte) ([]byte, error) {
+	// LZ4 block compression with length prefix
 	out := make([]byte, 4+len(data)*2)
 	binary.BigEndian.PutUint32(out[:4], uint32(len(data)))
-	n, err := lz4.CompressBlock(data, out[4:])
+	// lz4.CompressBlock expects a hashTable, pass nil for default (slow but simple)
+	n, err := lz4.CompressBlock(data, out[4:], nil)
 	if err != nil {
 		return nil, err
 	}
 	return out[:4+n], nil
 }
 
-// Decompression functions
+// --- Decompression functions ---
 
 func decompressFlate(data []byte) ([]byte, error) {
 	r := flate.NewReader(bytes.NewReader(data))
