@@ -4,42 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"io"
-
-	"github.com/pierrec/lz4/v4"
-	"github.com/v2Gas/Go/internal/lz4block"
-	"github.com/ulikunitz/xz"
 )
-
-// Additional decompressors for the server side
-
-func decompressLZ4(data []byte) ([]byte, error) {
-	var out bytes.Buffer
-	r := lz4.NewReader(bytes.NewReader(data))
-	_, err := io.Copy(&out, r)
-	return out.Bytes(), err
-}
-
-func decompressXZ(data []byte) ([]byte, error) {
-	r, err := xz.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	return io.ReadAll(r)
-}
-
-func decompressLZ4Block(data []byte) ([]byte, error) {
-	if len(data) < 4 {
-		return nil, errors.New("lz4block: truncated input")
-	}
-	unSize := binary.BigEndian.Uint32(data[:4])
-	dst := make([]byte, unSize)
-	n, err := lz4block.Decode(dst, data[4:])
-	if err != nil {
-		return nil, err
-	}
-	return dst[:n], nil
-}
 
 // Serverhello unpacking
 func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
