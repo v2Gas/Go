@@ -162,6 +162,13 @@ func (c *Conn) NetConn() net.Conn {
 	return c.conn
 }
 
+func (c *Conn) consumeHello(hello []byte) error {
+    // hello 是解包还原出的完整 ClientHello 或 ServerHello 消息
+    // 直接写入 handshake 缓冲区，等待正常 handshake 处理流程消费
+    c.hand.Reset(hello)
+    return nil
+}
+
 // A halfConn represents one direction of the record layer
 // connection, either sending or receiving.
 type halfConn struct {
