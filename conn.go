@@ -163,9 +163,8 @@ func (c *Conn) NetConn() net.Conn {
 }
 
 func (c *Conn) consumeHello(hello []byte) error {
-    // hello 是解包还原出的完整 ClientHello 或 ServerHello 消息
-    // 直接写入 handshake 缓冲区，等待正常 handshake 处理流程消费
-    c.hand.Reset(hello)
+    c.hand.Reset()         // 清空 handshake buffer
+    c.hand.Write(hello)    // 写入完整 hello 消息
     return nil
 }
 
