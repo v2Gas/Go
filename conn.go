@@ -116,9 +116,6 @@ type Conn struct {
 	activeCall int32
 
 	tmp [16]byte
-
-	gaseousHelloSent     bool
-        gaseousHelloReceived bool
 }
 
 // Access to net.Conn methods.
