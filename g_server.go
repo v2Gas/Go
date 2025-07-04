@@ -2,7 +2,6 @@ package tls
 
 import (
 	"encoding/binary"
-	"errors"
 )
 
 func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
