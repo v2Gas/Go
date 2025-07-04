@@ -1,7 +1,6 @@
 package tls
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,7 +9,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-// =================== uTLS ClientHello Database Support ===================
+// === uTLS ClientHello Database Support ===
 
 var allUTLSIDs = []utls.ClientHelloID{
 	utls.HelloChrome_58, utls.HelloChrome_62, utls.HelloChrome_70, utls.HelloChrome_72,
@@ -33,8 +32,6 @@ type GaseousClientHelloParams struct {
 	SessionID []byte
 	Other     map[string][]byte // for extra params like KeyShare etc.
 }
-
-// =================== ClientHello Packing for Gaseous ===================
 
 func matchUTLSClientHello(clientHelloBytes []byte, sni string, alpn []string) (string, *GaseousClientHelloParams) {
 	bestMatch := ""
@@ -85,11 +82,21 @@ func compareClientHelloSpec(msg *utls.ClientHelloMsg, spec *utls.ClientHelloSpec
 		score += overlap * 3
 	}
 	if len(msg.CompressionMethods) > 0 && len(spec.CompressionMethods) > 0 {
-		if bytes.Equal(msg.CompressionMethods, spec.CompressionMethods) {
+		equal := true
+		if len(msg.CompressionMethods) != len(spec.CompressionMethods) {
+			equal = false
+		} else {
+			for i := range msg.CompressionMethods {
+				if msg.CompressionMethods[i] != spec.CompressionMethods[i] {
+					equal = false
+					break
+				}
+			}
+		}
+		if equal {
 			score += 8
 		}
 	}
-	// ALPN overlap
 	if len(alpn) > 0 && len(spec.Extensions) > 0 {
 		var specALPN []string
 		for _, ext := range spec.Extensions {
@@ -107,7 +114,6 @@ func compareClientHelloSpec(msg *utls.ClientHelloMsg, spec *utls.ClientHelloSpec
 		}
 		score += match * 4
 	}
-	// SNI match
 	if sni != "" {
 		for _, ext := range spec.Extensions {
 			if e, ok := ext.(*utls.SNIExtension); ok && e.ServerName == sni {
@@ -118,10 +124,12 @@ func compareClientHelloSpec(msg *utls.ClientHelloMsg, spec *utls.ClientHelloSpec
 	// Extension types overlap
 	var msgExts, specExts []uint16
 	for _, e := range msg.Extensions {
-		msgExts = append(msgExts, e.Type())
+		et := utls.ExtensionTypeValue(e)
+		msgExts = append(msgExts, et)
 	}
 	for _, e := range spec.Extensions {
-		specExts = append(specExts, e.Type())
+		et := utls.ExtensionTypeValue(e)
+		specExts = append(specExts, et)
 	}
 	sort.Slice(msgExts, func(i, j int) bool { return msgExts[i] < msgExts[j] })
 	sort.Slice(specExts, func(i, j int) bool { return specExts[i] < specExts[j] })
@@ -154,7 +162,6 @@ func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 	alpn := c.config.NextProtos
 	clientHelloBytes := c.hand.Bytes()
 
-	// 优先尝试所有压缩算法（按算法号顺序依次尝试）
 	compressFuncs := []struct {
 		algo GaseousHelloCompressAlgo
 		fn   func([]byte) ([]byte, error)
@@ -168,7 +175,6 @@ func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 		{GaseousCompressLZ4Block, compressLZ4Block},
 	}
 
-	// Try uTLS特征结构打包
 	if specStr, params := matchUTLSClientHello(clientHelloBytes, sni, alpn); specStr != "" {
 		paramBytes, err := json.Marshal(params)
 		if err != nil {
@@ -190,7 +196,6 @@ func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 		return nil, errors.New("all compression failed")
 	}
 
-	// Fallback: 压缩原始ClientHello，优先选择压缩得更好（按算法优先级）
 	for _, cfn := range compressFuncs {
 		comp, err := cfn.fn(clientHelloBytes)
 		if err == nil {
@@ -207,7 +212,6 @@ func PackClientHelloGaseous(c *Conn) ([]byte, error) {
 	return nil, errors.New("all compression failed")
 }
 
-// =================== Gaseous ClientHello Decoding (for proxy/server) ===================
 func UnpackClientHelloGaseous(data []byte) ([]byte, error) {
 	if len(data) < gaseousHelloHeaderSize+1 {
 		return nil, ErrGaseousTrunc
@@ -308,20 +312,17 @@ func buildUTLSClientHello(params *GaseousClientHelloParams) ([]byte, error) {
 			}
 		}
 	}
-	if len(params.Random) == 32 {
-		spec.GetRandom = func() []byte { return params.Random }
-	}
-	if len(params.SessionID) > 0 {
-		spec.GetSessionID = func() []byte { return params.SessionID }
-	}
-
+	// spec.Random/SessionID字段不可直接动态赋值，uTLS生成时自动随机化。高级需求需补丁支持。
 	if err := uc.ApplyPreset(&spec); err != nil {
 		return nil, err
 	}
-
 	hello := uc.HandshakeState.Hello
 	if hello == nil {
 		return nil, errors.New("failed to build ClientHello")
 	}
-	return hello.Marshal(), nil
+	helloBytes, err := hello.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	return helloBytes, nil
 }
