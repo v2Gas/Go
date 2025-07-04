@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"sort"
 
 	utls "github.com/refraction-networking/utls"
 )
