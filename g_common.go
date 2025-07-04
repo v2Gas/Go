@@ -4,16 +4,14 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"encoding/binary"
 	"io"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 	"github.com/ulikunitz/xz"
-	"github.com/v2Gas/Go/internal/lz4block"
 )
-
-// ==== Gaseous Protocol Shared Constants, Types, Structs ====
 
 type GaseousHelloCompressAlgo uint8
 
@@ -40,12 +38,12 @@ const (
 )
 
 type GaseousHelloHeader struct {
-	Magic     [2]byte // "GS"
-	Version   uint8   // protocol version
-	Algo      uint8   // compression algo
-	HelloType uint8   // 1: ClientHello, 2: ServerHello
-	TemplID   uint16  // template ID (see template registry)
-	DataLen   uint32  // compressed payload length
+	Magic     [2]byte
+	Version   uint8
+	Algo      uint8
+	HelloType uint8
+	TemplID   uint16
+	DataLen   uint32
 }
 
 var (
@@ -61,27 +59,22 @@ type errorString string
 
 func (e errorString) Error() string { return string(e) }
 
-// HelloTemplate is a minimal "skeleton" that can be filled by parameters.
 type HelloTemplate struct {
-	Serialized []byte // Minimal template body, or marshaled handshake with placeholders
+	Serialized []byte
 }
 
-// GaseousTemplateRegistry maps template IDs to minimal Hello templates.
 type GaseousTemplateRegistry struct {
 	Templates map[uint16]*HelloTemplate
 }
 
-// Shared template registry for both client and server.
 var gaseousTemplates = &GaseousTemplateRegistry{
 	Templates: make(map[uint16]*HelloTemplate),
 }
 
-// RegisterGaseousTemplate allows both client and server to register templates.
 func RegisterGaseousTemplate(id uint16, tmpl *HelloTemplate) {
 	gaseousTemplates.Templates[id] = tmpl
 }
 
-// Template filling is shared (for both client/server fallback).
 func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
 	buf := make([]byte, len(tmpl.Serialized)+len(params))
 	copy(buf, tmpl.Serialized)
@@ -89,7 +82,7 @@ func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
 	return buf
 }
 
-// === 通用压缩（客户端打包用） ===
+// Compression functions
 
 func compressFlate(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
@@ -145,18 +138,17 @@ func compressXZ(data []byte) ([]byte, error) {
 	return buf.Bytes(), err
 }
 
-// LZ4Block: [4字节原始长度|LZ4Block压缩数据]
 func compressLZ4Block(data []byte) ([]byte, error) {
-	compressed := make([]byte, 4+len(data)+64)
-	binary.BigEndian.PutUint32(compressed[:4], uint32(len(data)))
-	n, err := lz4block.Encode(compressed[4:], data)
+	out := make([]byte, 4+len(data)*2)
+	binary.BigEndian.PutUint32(out[:4], uint32(len(data)))
+	n, err := lz4.CompressBlock(data, out[4:])
 	if err != nil {
 		return nil, err
 	}
-	return compressed[:4+n], nil
+	return out[:4+n], nil
 }
 
-// === 通用解压（服务端/客户端解包用） ===
+// Decompression functions
 
 func decompressFlate(data []byte) ([]byte, error) {
 	r := flate.NewReader(bytes.NewReader(data))
@@ -208,7 +200,7 @@ func decompressLZ4Block(data []byte) ([]byte, error) {
 	}
 	unSize := binary.BigEndian.Uint32(data[:4])
 	dst := make([]byte, unSize)
-	n, err := lz4block.Decode(dst, data[4:])
+	n, err := lz4.UncompressBlock(data[4:], dst)
 	if err != nil {
 		return nil, err
 	}
