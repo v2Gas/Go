@@ -14,7 +14,6 @@ require (
 require (
 	golang.org/x/text v0.3.8-0.20211105212822-18b340fc7af2 // indirect
 	github.com/cloudflare/circl v1.5.0
-	golang.org/x/crypto v0.36.0
 	golang.org/x/net v0.38.0
 	golang.org/x/sys v0.31.0
 )
