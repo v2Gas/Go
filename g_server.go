@@ -2,27 +2,46 @@ package tls
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"encoding/binary"
 	"errors"
 	"io"
 
-	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 	"github.com/v2Gas/Go/internal/lz4block"
 	"github.com/ulikunitz/xz"
 )
 
-var gaseousTemplates = &GaseousTemplateRegistry{
-	Templates: make(map[uint16]*HelloTemplate),
+// Additional decompressors for the server side
+
+func decompressLZ4(data []byte) ([]byte, error) {
+	var out bytes.Buffer
+	r := lz4.NewReader(bytes.NewReader(data))
+	_, err := io.Copy(&out, r)
+	return out.Bytes(), err
 }
 
-func RegisterGaseousTemplate(id uint16, tmpl *HelloTemplate) {
-	gaseousTemplates.Templates[id] = tmpl
+func decompressXZ(data []byte) ([]byte, error) {
+	r, err := xz.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r)
 }
 
+func decompressLZ4Block(data []byte) ([]byte, error) {
+	if len(data) < 4 {
+		return nil, errors.New("lz4block: truncated input")
+	}
+	unSize := binary.BigEndian.Uint32(data[:4])
+	dst := make([]byte, unSize)
+	n, err := lz4block.Decode(dst, data[4:])
+	if err != nil {
+		return nil, err
+	}
+	return dst[:n], nil
+}
+
+// Serverhello unpacking
 func UnpackServerHelloGaseous(data []byte) ([]byte, error) {
 	if len(data) < gaseousHelloHeaderSize {
 		return nil, ErrGaseousTrunc
@@ -83,76 +102,6 @@ func gaseousDecompressData(data []byte, algo GaseousHelloCompressAlgo) ([]byte, 
 	default:
 		return nil, ErrGaseousAlgo
 	}
-}
-
-func decompressFlate(data []byte) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(data))
-	defer r.Close()
-	return io.ReadAll(r)
-}
-
-func decompressGzip(data []byte) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
-}
-
-func decompressBrotli(data []byte) ([]byte, error) {
-	r := brotli.NewReader(bytes.NewReader(data))
-	return io.ReadAll(r)
-}
-
-func decompressZstd(data []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer decoder.Close()
-	return io.ReadAll(decoder)
-}
-
-func decompressLZ4(data []byte) ([]byte, error) {
-	var out bytes.Buffer
-	r := lz4.NewReader(bytes.NewReader(data))
-	_, err := io.Copy(&out, r)
-	return out.Bytes(), err
-}
-
-func decompressXZ(data []byte) ([]byte, error) {
-	r, err := xz.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	return io.ReadAll(r)
-}
-
-func decompressLZ4Block(data []byte) ([]byte, error) {
-	if len(data) < 4 {
-		return nil, errors.New("lz4block: truncated input")
-	}
-	unSize := binary.BigEndian.Uint32(data[:4])
-	dst := make([]byte, unSize)
-	n, err := lz4block.Decode(dst, data[4:])
-	if err != nil {
-		return nil, err
-	}
-	return dst[:n], nil
-}
-
-func fillHelloTemplate(tmpl *HelloTemplate, params []byte) []byte {
-	buf := make([]byte, len(tmpl.Serialized)+len(params))
-	copy(buf, tmpl.Serialized)
-	copy(buf[len(tmpl.Serialized):], params)
-	return buf
-}
-
-var gaseousDecompressAlgo = GaseousCompressFlate
-
-func SetGaseousDecompressAlgo(algo GaseousHelloCompressAlgo) {
-	gaseousDecompressAlgo = algo
 }
 
 func IsGaseousHello(data []byte) bool {
